@@ -1,0 +1,86 @@
+trigger:
+- main  # O pipeline será acionado ao receber alterações na branch "main".
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  S3_BUCKET: 'nome-do-seu-bucket'  # Nome do bucket S3 onde os logs serão armazenados.
+  AWS_REGION: 'us-east-1'          # Região da AWS.
+  VALIDATION_LOG: 'validation_log.txt'  # Nome do arquivo de log.
+
+stages:
+- stage: Validation
+  displayName: "Validação de XML"
+  jobs:
+  - job: ValidateXML
+    displayName: "Testar e Validar XMLs"
+    steps:
+    - checkout: self  # Clona o repositório automaticamente.
+
+    - task: UsePythonVersion@0
+      inputs:
+        versionSpec: '3.x'
+
+    - script: |
+        pip install lxml boto3
+      displayName: "Instalar dependências (lxml, boto3)"
+
+    - script: |
+        LOG_FILE=${VALIDATION_LOG}
+        echo "Iniciando validação de XMLs" > $LOG_FILE
+        
+        # Loop pelos arquivos XML
+        for file in arquivos/*.xml; do
+          echo "Validando arquivo: $file" >> $LOG_FILE
+          
+          # Teste de conformidade do XML (bem formado)
+          python -c "
+          from lxml import etree
+          try:
+              etree.parse('$file')
+              print('XML bem formado.')
+          except etree.XMLSyntaxError as e:
+              print(f'Erro de conformidade no XML: {e}')
+              exit(1)
+          " || echo "Conformidade: FALHA" >> $LOG_FILE && continue
+
+          # Validação contra esquema XSD
+          python -c "
+          from lxml import etree
+          try:
+              schema = etree.XMLSchema(etree.parse('schema.xsd'))
+              doc = etree.parse('$file')
+              schema.assertValid(doc)
+              print('XML válido contra o XSD.')
+          except (etree.XMLSchemaError, etree.DocumentInvalid) as e:
+              print(f'Erro de validação contra XSD: {e}')
+              exit(1)
+          " || echo "XSD Validação: FALHA" >> $LOG_FILE && continue
+
+          # Verificação de vulnerabilidades no XML
+          if grep -E 'ENTITY|<!DOCTYPE' $file; then
+            echo "Vulnerabilidade XXE detectada no arquivo $file" >> $LOG_FILE
+            exit 1
+          fi
+
+          if grep -E 'DROP TABLE|DELETE FROM' $file; then
+            echo "Possível tentativa de SQL Injection detectada no arquivo $file" >> $LOG_FILE
+            exit 1
+          fi
+
+          echo "Arquivo $file validado com sucesso." >> $LOG_FILE
+        done
+
+        echo "Validação concluída." >> $LOG_FILE
+      displayName: "Validar XMLs"
+
+    - script: |
+        # Enviar o log de validação para o S3
+        python -c "
+        import boto3
+        s3 = boto3.client('s3', region_name='${AWS_REGION}')
+        s3.upload_file('${VALIDATION_LOG}', '${S3_BUCKET}', '${VALIDATION_LOG}')
+        print(f'Log de validação enviado para o bucket S3 {os.environ["S3_BUCKET"]}')
+        "
+      displayName: "Upload do log para S3"
